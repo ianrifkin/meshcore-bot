@@ -201,7 +201,8 @@
       },
       "paths": {
         "none": "No path data",
-        "format": "{rank} {sender} {path}"
+        "format": "{rank} {sender} {path}",
+        "synopsis": "{rank} {sender}: {hops} hops"
       },
       "adverts": {
         "header": "Top Advert Nodes (24h):",
@@ -285,6 +286,7 @@
       "generate_key": "💡 Generate a custom key: https://gessaman.com/mc-keygen",
       "prefix_db_all": "Prefix {prefix}: {count} repeater{plural}",
       "prefix_db_recent": "Prefix {prefix}: {count} repeater{plural} ({days})",
+      "older_entries_note": "(Entries may be older than {days} days)",
       "prefix_api": "📡 Prefix {prefix} ({count} repeater{plural}):",
       "item_format": "{index}. {name}",
       "source_domain": "Source: {domain}",

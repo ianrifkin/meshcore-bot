@@ -16,15 +16,12 @@ import signal
 import atexit
 import sqlite3
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 
 # Import the official meshcore package
 import meshcore
 from meshcore import EventType
-
-# Import command functions from meshcore-cli
-from meshcore_cli.meshcore_cli import send_cmd, send_chan_msg
 
 # Import our modules
 from .rate_limiter import RateLimiter, BotTxRateLimiter, PerUserRateLimiter, NominatimRateLimiter
@@ -175,7 +172,10 @@ class MeshCoreBot:
         # Load max_channels from config (default 40, MeshCore supports up to 40 channels)
         max_channels = self.config.getint('Bot', 'max_channels', fallback=40)
         self.channel_manager = ChannelManager(self, max_channels=max_channels)
-        
+
+        # Callbacks invoked when the bot sends a channel message (e.g. Discord/Telegram bridges)
+        self.channel_sent_listeners: List[Callable] = []
+
         self.scheduler = MessageScheduler(self)
         
         # Initialize feed manager
@@ -213,7 +213,9 @@ class MeshCoreBot:
         # Initialize service plugin loader and load all services
         self.logger.info("Initializing service plugin loader")
         try:
-            self.service_loader = ServicePluginLoader(self)
+            self.service_loader = ServicePluginLoader(
+                self, local_services_dir=str(self._local_root / "service_plugins")
+            )
             self.services = self.service_loader.load_all_services()
             self.logger.info(f"Service plugin loader initialized with {len(self.services)} service(s)")
         except (OSError, ImportError, AttributeError, ValueError) as e:
@@ -267,7 +269,18 @@ class MeshCoreBot:
         
         # Force UTF-8 so emoji and non-ASCII characters in config.ini parse on Windows.
         self.config.read(self.config_file, encoding="utf-8")
-    
+        # Resolve local plugins directory from [Bot] local_dir_path (default: local)
+        self._local_root = Path(
+            resolve_path(
+                self.config.get("Bot", "local_dir_path", fallback="local"),
+                self.bot_root,
+            )
+        )
+        # Merge local config if present (user plugins/services settings)
+        local_config = self._local_root / "config.ini"
+        if local_config.exists():
+            self.config.read(local_config, encoding="utf-8")
+
     def _get_radio_settings(self) -> Dict[str, Any]:
         """Get current radio/connection settings from config.
         
@@ -329,6 +342,9 @@ class MeshCoreBot:
             
             # Reload the config
             self.config.read(self.config_file, encoding="utf-8")
+            local_config = self._local_root / "config.ini"
+            if local_config.exists():
+                self.config.read(local_config, encoding="utf-8")
             
             # Update rate limiters
             new_rate_limit = self.config.getint('Bot', 'rate_limit_seconds', fallback=10)
@@ -543,6 +559,8 @@ admin_commands = repeater
 # {rssi}: Received signal strength indicator in dBm
 # {timestamp}: Message timestamp in HH:MM:SS format
 # {path}: Message routing path (e.g., "01,5f (2 hops)")
+# {hops}: Total hop count only (e.g., "2" or "0"); same value as in path/connection_info
+# {hops_label}: Same as hops with "hop"/"hops" and pluralization (e.g., "1 hop", "2 hops")
 # {path_distance}: Total distance between all hops in path with locations (e.g., "123.4km (3 segs, 1 no-loc)")
 # {firstlast_distance}: Distance between first and last repeater in path (e.g., "45.6km" or empty if locations missing)
 test = "ack [@{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}"
@@ -1344,8 +1362,21 @@ long_jokes = false
             except (AttributeError, TypeError):
                 print("Web viewer stopped")
         
+        # Wait for scheduler thread to exit (it checks self.connected)
+        if hasattr(self, 'scheduler') and self.scheduler and self.scheduler.scheduler_thread:
+            self.scheduler.join(timeout=5.0)
+        
         if self.meshcore:
-            await self.meshcore.disconnect()
+            disconnect_timeout = self.config.getfloat('Bot', 'disconnect_timeout_seconds', fallback=10.0)
+            try:
+                await asyncio.wait_for(self.meshcore.disconnect(), timeout=disconnect_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "MeshCore disconnect timed out after %.1fs; continuing shutdown",
+                    disconnect_timeout,
+                )
+            except Exception as e:
+                self.logger.warning("Error during meshcore disconnect: %s", e)
         
         try:
             self.logger.info("Bot stopped")

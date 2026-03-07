@@ -89,7 +89,12 @@ class CommandManager:
         self.command_prefix = self.load_command_prefix()
         
         # Initialize plugin loader and load all plugins
-        self.plugin_loader = PluginLoader(bot)
+        local_commands_dir = (
+            str(bot._local_root / "commands")
+            if getattr(bot, "_local_root", None) is not None
+            else str(bot.bot_root / "local" / "commands")
+        )
+        self.plugin_loader = PluginLoader(bot, local_commands_dir=local_commands_dir)
         self.commands = self.plugin_loader.load_all_plugins()
         
         # Cache for internet connectivity status to avoid checking on every command
@@ -719,8 +724,26 @@ class CommandManager:
             if not self.bot.config.getboolean('Channels', 'respond_to_dms', fallback=True):
                 return None
         else:
-            if message.channel not in self.monitor_channels:
-                return None
+            # Optional per-trigger channel list: channel.<key> or channels.<key> (e.g. channel.momjoke = #jokes)
+            # When set, trigger is allowed only in those channels (even if not in global monitor_channels)
+            channel_opt = self.bot.config.get('RandomLine', f'channel.{key}', fallback='').strip()
+            if not channel_opt:
+                channel_opt = self.bot.config.get('RandomLine', f'channels.{key}', fallback='').strip()
+            if channel_opt:
+                allowed = [ch.strip() for ch in channel_opt.split(',') if ch.strip()]
+                if allowed:
+                    # Normalize for comparison: lowercase, strip optional #
+                    msg_ch = (message.channel or '').lower().strip().lstrip('#')
+                    allowed_normalized = {ch.lower().strip().lstrip('#') for ch in allowed}
+                    if msg_ch not in allowed_normalized:
+                        return None
+                    # Per-trigger channels allowed even when not in monitor_channels; skip global check
+                else:
+                    if message.channel not in self.monitor_channels:
+                        return None
+            else:
+                if message.channel not in self.monitor_channels:
+                    return None
             if not self._is_channel_trigger_allowed(key, message):
                 return None
 
@@ -890,20 +913,13 @@ class CommandManager:
         command_id: Optional[str] = None,
         skip_user_rate_limit: bool = False,
         rate_limit_key: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
-        """Send a channel message using meshcore-cli command.
+        """Send a channel message using meshcore_py (optional flood scope).
         
         Resolves channel names to numbers and handles rate limiting.
-        
-        Args:
-            channel: The channel name (e.g., "LongFast").
-            content: The message content to send.
-            command_id: Optional command_id for repeat tracking (if not provided, one will be generated).
-            skip_user_rate_limit: If True, skip user rate limiter checks (for automated responses).
-            rate_limit_key: Optional key for per-user rate limiting (e.g. from get_rate_limit_key(message)).
-            
-        Returns:
-            bool: True if sent successfully, False otherwise.
+        If [Channels] flood_scope is set (or scope is passed), uses that scope
+        for this send then restores global flood. Scope values "" / "*" / "0" mean global.
         """
         if not self.bot.connected or not self.bot.meshcore:
             return False
@@ -943,19 +959,98 @@ class CommandManager:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
             
-            # Use meshcore-cli send_chan_msg function
-            from meshcore_cli.meshcore_cli import send_chan_msg
-            result = await send_chan_msg(self.bot.meshcore, channel_num, content)
+            # Optional flood scope (region): set before send, restore after
+            scope_cfg = ""
+            if self.bot.config.has_section("Channels") and self.bot.config.has_option("Channels", "flood_scope"):
+                scope_cfg = (self.bot.config.get("Channels", "flood_scope") or "").strip()
+            scope_to_use = (scope if scope is not None else scope_cfg) or ""
+            scope_is_global = scope_to_use in ("", "*", "0", "None")
+            if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+            
+            try:
+                # Use meshcore_py directly (no meshcore-cli for channel sends)
+                result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
+            finally:
+                if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                    await self.bot.meshcore.commands.set_flood_scope("*")
             
             # Handle result using unified handler
             target = f"{channel} (channel {channel_num})"
-            return self._handle_send_result(
+            success = self._handle_send_result(
                 result, "Channel message", target, rate_limit_key=rate_limit_key
             )
+            if success and getattr(self.bot, 'channel_sent_listeners', None):
+                bot_name = self.bot.config.get('Bot', 'bot_name', fallback='Bot')
+                payload = {'channel_idx': channel_num, 'text': f'{bot_name}: {content}'}
+                synthetic_event = type('Event', (), {'payload': payload})()
+                for cb in list(self.bot.channel_sent_listeners):
+                    async def _run_listener(listener, event):
+                        try:
+                            await listener(event, None)
+                        except Exception as e:
+                            self.logger.warning(
+                                "Channel sent listener error: %s", e, exc_info=True
+                            )
+                    asyncio.create_task(_run_listener(cb, synthetic_event))
+            return success
                 
         except Exception as e:
             self.logger.error(f"Failed to send channel message: {e}")
             return False
+    
+    async def send_channel_messages_chunked(
+        self,
+        channel: str,
+        chunks: List[str],
+        *,
+        command_id: Optional[str] = None,
+        skip_user_rate_limit: bool = True,
+        rate_limit_key: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> bool:
+        """Send multiple channel messages with rate-limit spacing between chunks.
+        
+        Uses bot_tx_rate_limiter and configured bot_tx_rate_limit_seconds so each
+        chunk after the first is spaced correctly. For the first chunk, uses the
+        provided skip_user_rate_limit and rate_limit_key; subsequent chunks
+        always use skip_user_rate_limit=True so automated multi-part sends work.
+        
+        Args:
+            channel: Channel name to send to.
+            chunks: List of message strings to send in order.
+            command_id: Optional command_id for repeat tracking.
+            skip_user_rate_limit: If True, skip user/global rate limit for first chunk (default True for services).
+            rate_limit_key: Optional key for per-user rate limit on first chunk only.
+            scope: Optional flood scope for send (see send_channel_message).
+        
+        Returns:
+            bool: True if all chunks were sent successfully, False on first failure.
+        """
+        if not chunks:
+            return True
+        rate_limit_seconds = self.bot.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
+        sleep_time = max(rate_limit_seconds + 0.5, 1.0)
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await self.bot.bot_tx_rate_limiter.wait_for_tx()
+                await asyncio.sleep(sleep_time)
+            skip_first = skip_user_rate_limit if i == 0 else True
+            key_first = rate_limit_key if i == 0 else None
+            success = await self.send_channel_message(
+                channel,
+                chunk,
+                command_id=command_id,
+                skip_user_rate_limit=skip_first,
+                rate_limit_key=key_first,
+                scope=scope,
+            )
+            if not success:
+                self.logger.warning(
+                    "Chunked channel send failed at chunk %d of %d to %s", i + 1, len(chunks), channel
+                )
+                return False
+        return True
     
     def get_help_for_command(self, command_name: str, message: MeshMessage = None) -> str:
         """Get help text for a specific command (LoRa-friendly compact format).
@@ -1173,6 +1268,55 @@ class CommandManager:
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
             return False
+    
+    async def send_response_chunked(
+        self, message: MeshMessage, chunks: List[str], *, skip_user_rate_limit_first: bool = True
+    ) -> bool:
+        """Send multiple response messages (channel or DM) with rate-limit spacing.
+        
+        For channel: delegates to send_channel_messages_chunked. For DM: loops
+        with wait_for_tx + sleep between chunks and send_dm per chunk. First chunk
+        may count against user rate limit depending on skip_user_rate_limit_first;
+        subsequent chunks always skip user rate limit.
+        
+        Args:
+            message: The original message being responded to.
+            chunks: List of message strings to send in order.
+            skip_user_rate_limit_first: If True, skip user rate limit for first chunk too (default).
+            
+        Returns:
+            bool: True if all chunks were sent successfully, False on first failure.
+        """
+        if not chunks:
+            return True
+        rate_limit_key = self.get_rate_limit_key(message)
+        if message.is_dm:
+            rate_limit_seconds = self.bot.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
+            sleep_time = max(rate_limit_seconds + 0.5, 1.0)
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    await self.bot.bot_tx_rate_limiter.wait_for_tx()
+                    await asyncio.sleep(sleep_time)
+                skip = skip_user_rate_limit_first if i == 0 else True
+                success = await self.send_dm(
+                    message.sender_id,
+                    chunk,
+                    skip_user_rate_limit=skip,
+                    rate_limit_key=rate_limit_key,
+                )
+                if not success:
+                    self.logger.warning(
+                        "Chunked DM send failed at chunk %d of %d to %s",
+                        i + 1, len(chunks), message.sender_id,
+                    )
+                    return False
+            return True
+        return await self.send_channel_messages_chunked(
+            message.channel,
+            chunks,
+            skip_user_rate_limit=skip_user_rate_limit_first,
+            rate_limit_key=rate_limit_key,
+        )
     
     async def execute_commands(self, message):
         """Execute command objects that handle their own responses.

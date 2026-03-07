@@ -6,6 +6,7 @@ Pytest fixtures for meshcore-bot tests
 import pytest
 import sqlite3
 import configparser
+from contextlib import closing
 from unittest.mock import Mock, MagicMock, AsyncMock
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -198,13 +199,14 @@ def test_db(mock_logger, tmp_path):
         contact_source TEXT DEFAULT 'advertisement',
         out_path TEXT,
         out_path_len INTEGER,
+        out_bytes_per_hop INTEGER,
         is_starred INTEGER DEFAULT 0
     ''')
     
     # Create indexes (after tables are created)
     # Create indexes (db_manager created tables in same db_path)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
             # Check if table exists before creating indexes
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mesh_connections'")
@@ -235,6 +237,8 @@ def mock_bot(mock_logger, test_config, test_db):
     bot.config = test_config
     bot.db_manager = test_db
     bot.bot_root = '/tmp'  # Dummy path for testing
+    bot.prefix_hex_chars = 2  # For path/prefix logic (PR #77)
+    bot.key_prefix = lambda pk: (pk or '')[: getattr(bot, 'prefix_hex_chars', 2)]  # For path_command graph selection
     
     # Mock repeater_manager if needed
     bot.repeater_manager = Mock()
